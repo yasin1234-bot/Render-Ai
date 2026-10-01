@@ -1,26 +1,35 @@
 import os
 import time
 import json
+import atexit
 import requests
 import threading
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
-TARGETS_FILE = "/tmp/targets.json"   # ✅ /tmp writable in Render
+# ---------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------
+TARGETS_FILE = "/tmp/targets.json"   # Render-এ writable
 
 targets = []
 targets_lock = threading.Lock()
+worker_lock = threading.Lock()
+worker_started = False
 
 RENDER_EXTERNAL_URL = os.environ.get(
     "RENDER_EXTERNAL_URL",
     "https://render-ai-zle2.onrender.com"
 )
 
-print(f"[INIT] Self-Ping URL = {RENDER_EXTERNAL_URL}", flush=True)
+print(f"[BOOT] Self-Ping URL = {RENDER_EXTERNAL_URL}", flush=True)
+print(f"[BOOT] PID = {os.getpid()}", flush=True)
 
 
-# ---------------- Persistence ----------------
+# ---------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------
 def load_targets():
     global targets
     if os.path.exists(TARGETS_FILE):
@@ -37,9 +46,9 @@ def load_targets():
                 }
                 for t in loaded if "url" in t
             ]
-            print(f"[INIT] Loaded {len(targets)} target(s)", flush=True)
+            print(f"[BOOT] Loaded {len(targets)} targets", flush=True)
         except Exception as e:
-            print(f"[INIT ERROR] {e}", flush=True)
+            print(f"[BOOT ERROR] load_targets: {e}", flush=True)
             targets = []
 
 
@@ -56,9 +65,10 @@ def save_targets():
 load_targets()
 
 
-# ---------------- Worker ----------------
+# ---------------------------------------------------------------
+# Ping helper
+# ---------------------------------------------------------------
 def do_ping(url, ua="KeepAlive-Ping/1.0", timeout=25):
-    """Ping a URL and return status string."""
     try:
         res = requests.get(
             url,
@@ -75,8 +85,11 @@ def do_ping(url, ua="KeepAlive-Ping/1.0", timeout=25):
         return f"Error: {str(e)[:40]}"
 
 
+# ---------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------
 def ping_worker():
-    print("[WORKER] Thread started", flush=True)
+    print(f"[WORKER] Started in PID={os.getpid()}", flush=True)
     last_self_ping = 0
     cycle = 0
 
@@ -86,13 +99,13 @@ def ping_worker():
             now = time.time()
             print(f"[WORKER] Cycle {cycle} @ {time.strftime('%H:%M:%S')}", flush=True)
 
-            # ---- Self ping every 4 min ----
+            # Self ping every 4 min
             if RENDER_EXTERNAL_URL and (now - last_self_ping >= 240):
                 status = do_ping(RENDER_EXTERNAL_URL, ua="KeepAlive-Self/1.0", timeout=45)
-                print(f"[Self-Ping] {RENDER_EXTERNAL_URL} -> {status}", flush=True)
+                print(f"[Self-Ping] -> {status}", flush=True)
                 last_self_ping = now
 
-            # ---- Target pings ----
+            # Target pings
             with targets_lock:
                 snapshot = list(targets)
 
@@ -101,7 +114,7 @@ def ping_worker():
                 if now - target["last_ping_timestamp"] >= interval_sec:
                     print(f"[PING-START] {target['url']}", flush=True)
                     status = do_ping(target["url"], timeout=25)
-                    print(f"[Ping] {target['url']} -> {status}", flush=True)
+                    print(f"[PING-DONE] {target['url']} -> {status}", flush=True)
 
                     with targets_lock:
                         for t in targets:
@@ -119,20 +132,50 @@ def ping_worker():
         time.sleep(10)
 
 
-# ✅ START WORKER IMMEDIATELY (not via daemon thread that can be GC'd)
-def start_worker():
-    t = threading.Thread(target=ping_worker, daemon=True, name="ping-worker")
-    t.start()
-    print("[INIT] Worker thread launched", flush=True)
+def ensure_worker_running():
+    """Start worker exactly once, safely across Gunicorn forks."""
+    global worker_started
+    with worker_lock:
+        alive = any(
+            t.name == "ping-worker" and t.is_alive()
+            for t in threading.enumerate()
+        )
+        if not alive:
+            t = threading.Thread(
+                target=ping_worker,
+                daemon=True,
+                name="ping-worker",
+            )
+            t.start()
+            worker_started = True
+            print(f"[BOOT] Worker thread launched (PID={os.getpid()})", flush=True)
+        else:
+            print(f"[BOOT] Worker already running (PID={os.getpid()})", flush=True)
 
 
-# Launch on import (Gunicorn will import this module)
-start_worker()
+# ✅ Start immediately at import time
+ensure_worker_running()
 
 
-# ---------------- Routes ----------------
+# ✅ ALSO start on the very first HTTP request — this guarantees the thread
+#    survives even if Gunicorn re-forks after import.
+@app.before_request
+def _ensure_worker_on_first_request():
+    ensure_worker_running()
+
+
+# ✅ Extra safety — re-start on any process exit signal if somehow dead
+@atexit.register
+def _shutdown():
+    print("[BOOT] Process exiting", flush=True)
+
+
+# ---------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------
 @app.route("/")
 def index():
+    ensure_worker_running()   # ✅ double-check every page load
     return render_template("index.html")
 
 
@@ -143,7 +186,7 @@ def get_targets():
             "url": t["url"],
             "interval": t["interval"],
             "last_ping": t["last_ping"],
-            "status": t["status"]
+            "status": t["status"],
         } for t in targets]
     return jsonify(data)
 
@@ -170,12 +213,14 @@ def add_target():
         targets.append({
             "url": url,
             "interval": interval,
-            "last_ping_timestamp": 0,
+            "last_ping_timestamp": 0,   # immediate first ping
             "last_ping": "Never",
-            "status": "Pending"
+            "status": "Pending",
         })
 
     save_targets()
+    ensure_worker_running()   # ✅ safety
+    print(f"[API] Added target: {url}", flush=True)
     return jsonify({"message": "Added"}), 201
 
 
@@ -194,22 +239,32 @@ def delete_target():
 
 @app.route("/healthz")
 def healthz():
+    ensure_worker_running()   # ✅ ping this → keeps worker alive
     return "OK", 200
 
 
-# ✅ Debug endpoint — check worker status live
 @app.route("/api/debug")
 def debug():
     return jsonify({
+        "pid": os.getpid(),
         "worker_threads": [t.name for t in threading.enumerate()],
-        "worker_alive": any(t.name == "ping-worker" and t.is_alive()
-                            for t in threading.enumerate()),
+        "worker_alive": any(
+            t.name == "ping-worker" and t.is_alive()
+            for t in threading.enumerate()
+        ),
         "targets_count": len(targets),
+        "targets": [
+            {"url": t["url"], "status": t["status"], "last": t["last_ping"]}
+            for t in targets
+        ],
         "render_url": RENDER_EXTERNAL_URL,
         "time": time.strftime("%H:%M:%S"),
     })
 
 
+# ---------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
