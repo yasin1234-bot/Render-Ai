@@ -1,1 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KeepAlive Ping Engine</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #FAFAFA;
+            --card-bg: #FFFFFF;
+            --text-main: #0F172A;
+            --text-muted: #64748B;
+            --border: #E2E8F0;
+            --primary: #000000;
+            --primary-hover: #1E293B;
+            --danger: #EF4444;
+            --success-bg: #DCFCE7;
+            --success-text: #166534;
+        }
 
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text-main);
+            display: flex;
+            justify-content: center;
+            padding: 20px 16px;
+            min-height: 100vh;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 480px; /* Mobile focused container */
+        }
+
+        header {
+            margin-bottom: 24px;
+        }
+
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        header p {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+        }
+
+        .form-group {
+            margin-bottom: 14px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.95rem;
+            outline: none;
+            background: #FFF;
+            transition: border-color 0.2s;
+        }
+
+        input:focus, select:focus {
+            border-color: var(--primary);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background: var(--primary);
+            color: #FFF;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn:hover {
+            background: var(--primary-hover);
+        }
+
+        .section-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .target-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .target-item {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .target-info {
+            max-width: 75%;
+        }
+
+        .target-url {
+            font-size: 0.9rem;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .target-meta {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        .status-badge {
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: #F1F5F9;
+            color: var(--text-main);
+            margin-top: 6px;
+        }
+
+        .btn-delete {
+            background: transparent;
+            border: none;
+            color: var(--danger);
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            padding: 6px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 24px;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <header>
+            <h1>KeepAlive Engine</h1>
+            <p>Prevent Render apps from entering sleep mode.</p>
+        </header>
+
+        <div class="card">
+            <form id="add-form">
+                <div class="form-group">
+                    <label>Target Render URL</label>
+                    <input type="url" id="url" placeholder="https://your-app.onrender.com" required>
+                </div>
+                <div class="form-group">
+                    <label>Ping Interval</label>
+                    <select id="interval">
+                        <option value="2">Every 2 Minutes</option>
+                        <option value="5" selected>Every 5 Minutes (Recommended)</option>
+                        <option value="10">Every 10 Minutes</option>
+                        <option value="12">Every 12 Minutes</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn">Add Target URL</button>
+            </form>
+        </div>
+
+        <div class="section-title">Active Ping Targets</div>
+        <div id="target-list" class="target-list">
+            <div class="empty-state">No URLs added yet.</div>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('add-form');
+        const targetList = document.getElementById('target-list');
+
+        async function fetchTargets() {
+            try {
+                const res = await fetch('/api/targets');
+                const data = await res.json();
+                renderTargets(data);
+            } catch (err) {
+                console.error("Error fetching targets:", err);
+            }
+        }
+
+        function renderTargets(targets) {
+            if (targets.length === 0) {
+                targetList.innerHTML = '<div class="empty-state">No URLs added yet.</div>';
+                return;
+            }
+
+            targetList.innerHTML = targets.map(t => `
+                <div class="target-item">
+                    <div class="target-info">
+                        <div class="target-url">${escapeHtml(t.url)}</div>
+                        <div class="target-meta">Interval: ${t.interval} min | Last: ${t.last_ping}</div>
+                        <span class="status-badge">${t.status}</span>
+                    </div>
+                    <button class="btn-delete" onclick="deleteTarget('${escapeHtml(t.url)}')">Remove</button>
+                </div>
+            `).join('');
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const url = document.getElementById('url').value;
+            const interval = document.getElementById('interval').value;
+
+            await fetch('/api/targets', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, interval })
+            });
+
+            document.getElementById('url').value = '';
+            fetchTargets();
+        });
+
+        async function deleteTarget(url) {
+            await fetch('/api/targets/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url })
+            });
+            fetchTargets();
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+        }
+
+        // Auto refresh dashboard list every 10 seconds
+        setInterval(fetchTargets, 10000);
+        fetchTargets();
+    </script>
+</body>
+</html>
