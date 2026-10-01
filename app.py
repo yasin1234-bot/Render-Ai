@@ -7,131 +7,130 @@ from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------
-TARGETS_FILE = "targets.json"
+TARGETS_FILE = "/tmp/targets.json"   # ✅ /tmp writable in Render
 
 targets = []
 targets_lock = threading.Lock()
 
-# ✅ Hardcoded fallback — Render env var না থাকলেও কাজ করবে
 RENDER_EXTERNAL_URL = os.environ.get(
     "RENDER_EXTERNAL_URL",
     "https://render-ai-zle2.onrender.com"
 )
 
-print(f"[INIT] Self-Ping URL = {RENDER_EXTERNAL_URL}")
-print(f"[INIT] PORT = {os.environ.get('PORT', '5000')}")
+print(f"[INIT] Self-Ping URL = {RENDER_EXTERNAL_URL}", flush=True)
 
-# ---------------------------------------------------------------
-# Persistent storage (targets.json)
-# ---------------------------------------------------------------
+
+# ---------------- Persistence ----------------
 def load_targets():
-    """Load saved targets from JSON file."""
     global targets
     if os.path.exists(TARGETS_FILE):
         try:
             with open(TARGETS_FILE, "r") as f:
                 loaded = json.load(f)
-                # Ensure structure is correct
-                targets = [
-                    {
-                        "url": t["url"],
-                        "interval": int(t.get("interval", 5)),
-                        "last_ping_timestamp": 0,
-                        "last_ping": t.get("last_ping", "Never"),
-                        "status": t.get("status", "Pending"),
-                    }
-                    for t in loaded if "url" in t
-                ]
-            print(f"[INIT] Loaded {len(targets)} target(s) from {TARGETS_FILE}")
+            targets = [
+                {
+                    "url": t["url"],
+                    "interval": int(t.get("interval", 5)),
+                    "last_ping_timestamp": 0,
+                    "last_ping": t.get("last_ping", "Never"),
+                    "status": t.get("status", "Pending"),
+                }
+                for t in loaded if "url" in t
+            ]
+            print(f"[INIT] Loaded {len(targets)} target(s)", flush=True)
         except Exception as e:
-            print(f"[INIT ERROR] Could not load targets: {e}")
+            print(f"[INIT ERROR] {e}", flush=True)
             targets = []
-    else:
-        print(f"[INIT] No {TARGETS_FILE} found — starting fresh")
 
 
 def save_targets():
-    """Save targets to JSON file."""
     try:
+        with targets_lock:
+            snapshot = list(targets)
         with open(TARGETS_FILE, "w") as f:
-            json.dump(targets, f, indent=2)
+            json.dump(snapshot, f, indent=2)
     except Exception as e:
-        print(f"[SAVE ERROR] {e}")
+        print(f"[SAVE ERROR] {e}", flush=True)
 
 
-# Load persisted targets at startup
 load_targets()
 
-# ---------------------------------------------------------------
-# Background ping worker
-# ---------------------------------------------------------------
+
+# ---------------- Worker ----------------
+def do_ping(url, ua="KeepAlive-Ping/1.0", timeout=25):
+    """Ping a URL and return status string."""
+    try:
+        res = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": ua},
+            allow_redirects=True,
+        )
+        if res.status_code == 200:
+            return f"200 OK ({res.elapsed.total_seconds():.2f}s)"
+        return f"HTTP {res.status_code}"
+    except requests.exceptions.Timeout:
+        return "Timeout"
+    except Exception as e:
+        return f"Error: {str(e)[:40]}"
+
+
 def ping_worker():
-    """Background thread — self-ping + user target pings."""
+    print("[WORKER] Thread started", flush=True)
     last_self_ping = 0
+    cycle = 0
 
     while True:
-        current_time = time.time()
+        try:
+            cycle += 1
+            now = time.time()
+            print(f"[WORKER] Cycle {cycle} @ {time.strftime('%H:%M:%S')}", flush=True)
 
-        # 1) Self-ping every 4 minutes to keep THIS app awake
-        if RENDER_EXTERNAL_URL and (current_time - last_self_ping >= 240):
-            try:
-                res = requests.get(
-                    RENDER_EXTERNAL_URL,
-                    timeout=60,
-                    headers={"User-Agent": "KeepAlive-Self-Ping/1.0"},
-                    allow_redirects=True,
-                )
-                print(f"[Self-Ping] {RENDER_EXTERNAL_URL} -> {res.status_code}")
-            except Exception as e:
-                print(f"[Self-Ping Error] {e}")
-            last_self_ping = current_time
+            # ---- Self ping every 4 min ----
+            if RENDER_EXTERNAL_URL and (now - last_self_ping >= 240):
+                status = do_ping(RENDER_EXTERNAL_URL, ua="KeepAlive-Self/1.0", timeout=45)
+                print(f"[Self-Ping] {RENDER_EXTERNAL_URL} -> {status}", flush=True)
+                last_self_ping = now
 
-        # 2) Ping each user target based on its interval
-        with targets_lock:
-            for target in targets:
+            # ---- Target pings ----
+            with targets_lock:
+                snapshot = list(targets)
+
+            for target in snapshot:
                 interval_sec = target["interval"] * 60
+                if now - target["last_ping_timestamp"] >= interval_sec:
+                    print(f"[PING-START] {target['url']}", flush=True)
+                    status = do_ping(target["url"], timeout=25)
+                    print(f"[Ping] {target['url']} -> {status}", flush=True)
 
-                # First ping happens immediately (last_ping_timestamp = 0)
-                if current_time - target["last_ping_timestamp"] >= interval_sec:
-                    try:
-                        res = requests.get(
-                            target["url"],
-                            timeout=30,
-                            headers={"User-Agent": "KeepAlive-Ping/1.0"},
-                            allow_redirects=True,
-                        )
-                        if res.status_code == 200:
-                            target["status"] = f"200 OK ({res.elapsed.total_seconds():.2f}s)"
-                        else:
-                            target["status"] = f"HTTP {res.status_code}"
-                        print(f"[Ping] {target['url']} -> {target['status']}")
-                    except requests.exceptions.Timeout:
-                        target["status"] = "Timeout"
-                        print(f"[Ping Timeout] {target['url']}")
-                    except Exception as e:
-                        target["status"] = "Failed / Offline"
-                        print(f"[Ping Error] {target['url']} -> {e}")
+                    with targets_lock:
+                        for t in targets:
+                            if t["url"] == target["url"]:
+                                t["status"] = status
+                                t["last_ping_timestamp"] = time.time()
+                                t["last_ping"] = time.strftime("%H:%M:%S")
+                                break
 
-                    target["last_ping_timestamp"] = current_time
-                    target["last_ping"] = time.strftime("%H:%M:%S")
-
-            # Save state periodically so data survives restart
             save_targets()
+
+        except Exception as e:
+            print(f"[WORKER ERROR] {e}", flush=True)
 
         time.sleep(10)
 
 
-# Start background thread
-ping_thread = threading.Thread(target=ping_worker, daemon=True)
-ping_thread.start()
-print("[INIT] Ping worker thread started")
+# ✅ START WORKER IMMEDIATELY (not via daemon thread that can be GC'd)
+def start_worker():
+    t = threading.Thread(target=ping_worker, daemon=True, name="ping-worker")
+    t.start()
+    print("[INIT] Worker thread launched", flush=True)
 
-# ---------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------
+
+# Launch on import (Gunicorn will import this module)
+start_worker()
+
+
+# ---------------- Routes ----------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -159,26 +158,25 @@ def add_target():
         interval = 5
 
     if not url.startswith(("http://", "https://")):
-        return jsonify({"error": "Invalid URL. Include http:// or https://"}), 400
+        return jsonify({"error": "Invalid URL"}), 400
 
     with targets_lock:
-        # Update if exists
         for t in targets:
             if t["url"] == url:
                 t["interval"] = interval
                 save_targets()
-                return jsonify({"message": "Updated existing target"}), 200
+                return jsonify({"message": "Updated"}), 200
 
         targets.append({
             "url": url,
             "interval": interval,
-            "last_ping_timestamp": 0,   # ✅ triggers immediate first ping
+            "last_ping_timestamp": 0,
             "last_ping": "Never",
             "status": "Pending"
         })
-        save_targets()
 
-    return jsonify({"message": "URL added successfully"}), 201
+    save_targets()
+    return jsonify({"message": "Added"}), 201
 
 
 @app.route("/api/targets/delete", methods=["POST"])
@@ -189,20 +187,29 @@ def delete_target():
     with targets_lock:
         global targets
         targets = [t for t in targets if t["url"] != url]
-        save_targets()
 
-    return jsonify({"message": "Target removed"}), 200
+    save_targets()
+    return jsonify({"message": "Removed"}), 200
 
 
-# ✅ Health check for Render
 @app.route("/healthz")
 def healthz():
     return "OK", 200
 
 
-# ---------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------
+# ✅ Debug endpoint — check worker status live
+@app.route("/api/debug")
+def debug():
+    return jsonify({
+        "worker_threads": [t.name for t in threading.enumerate()],
+        "worker_alive": any(t.name == "ping-worker" and t.is_alive()
+                            for t in threading.enumerate()),
+        "targets_count": len(targets),
+        "render_url": RENDER_EXTERNAL_URL,
+        "time": time.strftime("%H:%M:%S"),
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
