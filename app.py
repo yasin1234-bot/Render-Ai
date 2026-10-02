@@ -17,6 +17,8 @@ import requests
 from flask import Flask, request, jsonify, render_template
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.jobstores.memory import MemoryJobStore
 
 # Configure logging
 logging.basicConfig(
@@ -33,8 +35,29 @@ DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(__file__), 'pin
 DEFAULT_PORT = int(os.environ.get('PORT', 5000))
 SELF_PING_INTERVAL_MINUTES = int(os.environ.get('SELF_PING_INTERVAL_MINUTES', '5'))
 
-# Initialize APScheduler
-scheduler = BackgroundScheduler(daemon=True)
+# ==============================================================================
+# APScheduler CONFIGURATION (FIXED FOR RENDER FREE TIER)
+# ==============================================================================
+# Use ThreadPoolExecutor with enough workers so pings don't block each other
+# Use MemoryJobStore (not persistent) to avoid stale job conflicts on restart
+jobstores = {
+    'default': MemoryJobStore()
+}
+executors = {
+    'default': ThreadPoolExecutor(max_workers=10)
+}
+job_defaults = {
+    'coalesce': True,           # If multiple runs missed, only run once
+    'max_instances': 1,         # Never run same job concurrently
+    'misfire_grace_time': 120,  # 2 min grace if scheduler was busy
+}
+
+scheduler = BackgroundScheduler(
+    jobstores=jobstores,
+    executors=executors,
+    job_defaults=job_defaults,
+    daemon=True
+)
 
 
 # ==============================================================================
@@ -42,7 +65,7 @@ scheduler = BackgroundScheduler(daemon=True)
 # ==============================================================================
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -186,42 +209,45 @@ def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI 
 
     iso_now = datetime.now(timezone.utc).isoformat()
 
+    # FIXED: Use try/finally to guarantee connection close
     try:
         conn = get_db_connection()
-        conn.execute('''
-            INSERT INTO ping_logs (target_id, target_name, url, status_code, latency_ms, status_message, is_success, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (target_id, target_name, url, status_code, latency_ms, status_message, 1 if is_success else 0, iso_now))
+        try:
+            conn.execute('''
+                INSERT INTO ping_logs (target_id, target_name, url, status_code, latency_ms, status_message, is_success, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (target_id, target_name, url, status_code, latency_ms, status_message, 1 if is_success else 0, iso_now))
 
-        if target_id != "self":
-            if is_success:
-                conn.execute('''
-                    UPDATE targets SET
-                        last_ping_time = ?,
-                        last_status_code = ?,
-                        last_latency_ms = ?,
-                        last_status_message = ?,
-                        consecutive_successes = consecutive_successes + 1,
-                        consecutive_failures = 0,
-                        total_pings = total_pings + 1
-                    WHERE id = ?
-                ''', (iso_now, status_code, latency_ms, status_message, target_id))
-            else:
-                conn.execute('''
-                    UPDATE targets SET
-                        last_ping_time = ?,
-                        last_status_code = ?,
-                        last_latency_ms = ?,
-                        last_status_message = ?,
-                        consecutive_successes = 0,
-                        consecutive_failures = consecutive_failures + 1,
-                        total_pings = total_pings + 1
-                    WHERE id = ?
-                ''', (iso_now, status_code, latency_ms, status_message, target_id))
-        
-        conn.execute("DELETE FROM ping_logs WHERE id NOT IN (SELECT id FROM ping_logs ORDER BY id DESC LIMIT 400)")
-        conn.commit()
-        conn.close()
+            if target_id != "self":
+                if is_success:
+                    conn.execute('''
+                        UPDATE targets SET
+                            last_ping_time = ?,
+                            last_status_code = ?,
+                            last_latency_ms = ?,
+                            last_status_message = ?,
+                            consecutive_successes = consecutive_successes + 1,
+                            consecutive_failures = 0,
+                            total_pings = total_pings + 1
+                        WHERE id = ?
+                    ''', (iso_now, status_code, latency_ms, status_message, target_id))
+                else:
+                    conn.execute('''
+                        UPDATE targets SET
+                            last_ping_time = ?,
+                            last_status_code = ?,
+                            last_latency_ms = ?,
+                            last_status_message = ?,
+                            consecutive_successes = 0,
+                            consecutive_failures = consecutive_failures + 1,
+                            total_pings = total_pings + 1
+                        WHERE id = ?
+                    ''', (iso_now, status_code, latency_ms, status_message, target_id))
+            
+            conn.execute("DELETE FROM ping_logs WHERE id NOT IN (SELECT id FROM ping_logs ORDER BY id DESC LIMIT 400)")
+            conn.commit()
+        finally:
+            conn.close()
     except Exception as db_err:
         logger.error(f"Failed to record ping result in database: {db_err}")
 
@@ -254,16 +280,19 @@ def self_keep_alive_job():
 def ping_target_job(target_id: str):
     """
     Worker job executed by APScheduler for a specific registered target.
-    FIXED: Better exception handling so job doesn't silently fail.
+    FIXED: Guaranteed connection close + clearer logging.
     """
     try:
         conn = get_db_connection()
-        row = conn.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
+        finally:
+            conn.close()
         
         if not row:
             logger.warning(f"Target {target_id} not found in DB. Removing job.")
-            if scheduler.get_job(f"target_{target_id}"):
+            job = scheduler.get_job(f"target_{target_id}")
+            if job:
                 scheduler.remove_job(f"target_{target_id}")
             return
             
@@ -280,12 +309,14 @@ def ping_target_job(target_id: str):
 def sync_scheduler_jobs():
     """
     Synchronizes APScheduler jobs with current active targets in SQLite.
+    FIXED: Removes old jobs before re-adding to prevent overwrite bugs.
     """
     # 1. Sync Automated Self Keep-Alive
     self_enabled = get_setting("self_ping_enabled", "true") == "true"
     self_interval = int(get_setting("self_ping_interval", str(SELF_PING_INTERVAL_MINUTES)))
     
-    if scheduler.get_job("self_keep_alive"):
+    existing_self = scheduler.get_job("self_keep_alive")
+    if existing_self:
         scheduler.remove_job("self_keep_alive")
         
     if self_enabled:
@@ -301,8 +332,10 @@ def sync_scheduler_jobs():
     # 2. Sync Target URLs
     try:
         conn = get_db_connection()
-        targets = conn.execute("SELECT * FROM targets").fetchall()
-        conn.close()
+        try:
+            targets = conn.execute("SELECT * FROM targets").fetchall()
+        finally:
+            conn.close()
 
         active_ids = {f"target_{t['id']}" for t in targets}
         for job in scheduler.get_jobs():
@@ -312,20 +345,23 @@ def sync_scheduler_jobs():
         for target in targets:
             job_id = f"target_{target['id']}"
             if target['is_active']:
-                # FIXED: Ensure interval is at least 1 minute and job is properly registered
                 interval = max(1, int(target['interval_minutes']))
+                # Remove old job first to prevent stale triggers
+                existing = scheduler.get_job(job_id)
+                if existing:
+                    scheduler.remove_job(job_id)
                 scheduler.add_job(
                     ping_target_job,
                     args=[target['id']],
                     trigger=IntervalTrigger(minutes=interval),
                     id=job_id,
                     replace_existing=True,
-                    name=f"Keep-Alive for {target['name']}",
-                    misfire_grace_time=60  # Allow 60s grace if scheduler was busy
+                    name=f"Keep-Alive for {target['name']}"
                 )
                 logger.info(f"Scheduled job for '{target['name']}' every {interval} min.")
             else:
-                if scheduler.get_job(job_id):
+                existing = scheduler.get_job(job_id)
+                if existing:
                     scheduler.remove_job(job_id)
                     
         logger.info(f"Scheduler synchronized with {len(targets)} targets.")
@@ -368,12 +404,14 @@ def healthz():
 @app.route('/api/status', methods=['GET'])
 def get_system_status():
     conn = get_db_connection()
-    targets = [dict(t) for t in conn.execute("SELECT * FROM targets ORDER BY created_at DESC").fetchall()]
-    total_logs = conn.execute("SELECT COUNT(*) as cnt FROM ping_logs").fetchone()['cnt']
-    success_logs = conn.execute("SELECT COUNT(*) as cnt FROM ping_logs WHERE is_success = 1").fetchone()['cnt']
-    avg_latency = conn.execute("SELECT AVG(latency_ms) as avg_lat FROM ping_logs WHERE is_success = 1").fetchone()['avg_lat']
-    recent_logs = [dict(l) for l in conn.execute("SELECT * FROM ping_logs ORDER BY id DESC LIMIT 50").fetchall()]
-    conn.close()
+    try:
+        targets = [dict(t) for t in conn.execute("SELECT * FROM targets ORDER BY created_at DESC").fetchall()]
+        total_logs = conn.execute("SELECT COUNT(*) as cnt FROM ping_logs").fetchone()['cnt']
+        success_logs = conn.execute("SELECT COUNT(*) as cnt FROM ping_logs WHERE is_success = 1").fetchone()['cnt']
+        avg_latency = conn.execute("SELECT AVG(latency_ms) as avg_lat FROM ping_logs WHERE is_success = 1").fetchone()['avg_lat']
+        recent_logs = [dict(l) for l in conn.execute("SELECT * FROM ping_logs ORDER BY id DESC LIMIT 50").fetchall()]
+    finally:
+        conn.close()
 
     self_url = get_automated_self_url()
     self_enabled = get_setting("self_ping_enabled", "true") == "true"
@@ -401,10 +439,6 @@ def get_system_status():
 
 @app.route('/api/targets', methods=['POST'])
 def add_target():
-    """
-    Registers a new external Render app URL to monitor and keep alive.
-    FIXED: Immediately schedules the job and triggers an initial ping.
-    """
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
     url = (data.get('url') or '').strip()
@@ -431,29 +465,33 @@ def add_target():
     iso_now = datetime.now(timezone.utc).isoformat()
 
     conn = get_db_connection()
-    conn.execute('''
-        INSERT INTO targets (id, name, url, interval_minutes, is_active, consecutive_successes, consecutive_failures, total_pings, created_at)
-        VALUES (?, ?, ?, ?, 1, 0, 0, 0, ?)
-    ''', (target_id, name, url, interval, iso_now))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute('''
+            INSERT INTO targets (id, name, url, interval_minutes, is_active, consecutive_successes, consecutive_failures, total_pings, created_at)
+            VALUES (?, ?, ?, ?, 1, 0, 0, 0, ?)
+        ''', (target_id, name, url, interval, iso_now))
+        conn.commit()
+    finally:
+        conn.close()
 
-    # FIXED: Register the recurring job immediately
+    # Register recurring job immediately
     job_id = f"target_{target_id}"
+    existing = scheduler.get_job(job_id)
+    if existing:
+        scheduler.remove_job(job_id)
     scheduler.add_job(
         ping_target_job,
         args=[target_id],
         trigger=IntervalTrigger(minutes=interval),
         id=job_id,
         replace_existing=True,
-        name=f"Keep-Alive for {name}",
-        misfire_grace_time=60
+        name=f"Keep-Alive for {name}"
     )
     logger.info(f"Registered new recurring job '{job_id}' every {interval} min for {name}.")
 
-    # FIXED: Trigger immediate initial ping in background (so user sees activity right away)
+    # Immediate initial ping in background
     def run_initial_ping():
-        time.sleep(1)
+        time.sleep(2)
         try:
             execute_ping(url, target_id=target_id, target_name=name)
         except Exception as e:
@@ -478,10 +516,12 @@ def add_target():
 @app.route('/api/targets/<target_id>', methods=['DELETE'])
 def delete_target(target_id: str):
     conn = get_db_connection()
-    conn.execute("DELETE FROM targets WHERE id = ?", (target_id,))
-    conn.execute("DELETE FROM ping_logs WHERE target_id = ?", (target_id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("DELETE FROM targets WHERE id = ?", (target_id,))
+        conn.execute("DELETE FROM ping_logs WHERE target_id = ?", (target_id,))
+        conn.commit()
+    finally:
+        conn.close()
 
     job_id = f"target_{target_id}"
     if scheduler.get_job(job_id):
@@ -493,40 +533,40 @@ def delete_target(target_id: str):
 @app.route('/api/targets/<target_id>/toggle', methods=['POST'])
 def toggle_target(target_id: str):
     conn = get_db_connection()
-    row = conn.execute("SELECT is_active, name FROM targets WHERE id = ?", (target_id,)).fetchone()
-    if not row:
-        conn.close()
-        return jsonify({"error": "Target not found."}), 404
+    try:
+        row = conn.execute("SELECT is_active, name FROM targets WHERE id = ?", (target_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "Target not found."}), 404
 
-    new_state = 0 if row['is_active'] else 1
-    conn.execute("UPDATE targets SET is_active = ? WHERE id = ?", (new_state, target_id))
-    conn.commit()
-    conn.close()
+        new_state = 0 if row['is_active'] else 1
+        conn.execute("UPDATE targets SET is_active = ? WHERE id = ?", (new_state, target_id))
+        conn.commit()
+        target_name = row['name']
+        interval_row = conn.execute("SELECT interval_minutes FROM targets WHERE id = ?", (target_id,)).fetchone()
+    finally:
+        conn.close()
 
     job_id = f"target_{target_id}"
-    if new_state:
-        # Resume: re-register the job
-        target_row = get_db_connection().execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
-        if target_row:
-            interval = max(1, int(target_row['interval_minutes']))
-            scheduler.add_job(
-                ping_target_job,
-                args=[target_id],
-                trigger=IntervalTrigger(minutes=interval),
-                id=job_id,
-                replace_existing=True,
-                name=f"Keep-Alive for {target_row['name']}",
-                misfire_grace_time=60
-            )
-    else:
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
+    existing = scheduler.get_job(job_id)
+    if existing:
+        scheduler.remove_job(job_id)
+
+    if new_state and interval_row:
+        interval = max(1, int(interval_row['interval_minutes']))
+        scheduler.add_job(
+            ping_target_job,
+            args=[target_id],
+            trigger=IntervalTrigger(minutes=interval),
+            id=job_id,
+            replace_existing=True,
+            name=f"Keep-Alive for {target_name}"
+        )
 
     action = "resumed" if new_state else "paused"
     return jsonify({
         "success": True,
         "is_active": new_state,
-        "message": f"Keep-alive for '{row['name']}' {action}."
+        "message": f"Keep-alive for '{target_name}' {action}."
     })
 
 
@@ -538,8 +578,10 @@ def ping_target_now(target_id: str):
         return jsonify({"success": True, "result": result})
 
     conn = get_db_connection()
-    row = conn.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
-    conn.close()
+    try:
+        row = conn.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
+    finally:
+        conn.close()
 
     if not row:
         return jsonify({"error": "Target not found."}), 404
@@ -572,17 +614,21 @@ def update_settings():
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
     conn = get_db_connection()
-    logs = conn.execute("SELECT * FROM ping_logs ORDER BY id DESC LIMIT 100").fetchall()
-    conn.close()
+    try:
+        logs = conn.execute("SELECT * FROM ping_logs ORDER BY id DESC LIMIT 100").fetchall()
+    finally:
+        conn.close()
     return jsonify({"logs": [dict(l) for l in logs]})
 
 
 @app.route('/api/logs', methods=['DELETE'])
 def clear_logs():
     conn = get_db_connection()
-    conn.execute("DELETE FROM ping_logs")
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("DELETE FROM ping_logs")
+        conn.commit()
+    finally:
+        conn.close()
     return jsonify({"success": True, "message": "Logs cleared."})
 
 
@@ -598,7 +644,7 @@ if not scheduler.running:
     logger.info("APScheduler worker running in background.")
 
     def delayed_initial_ping():
-        time.sleep(3)
+        time.sleep(5)
         self_keep_alive_job()
 
     threading.Thread(target=delayed_initial_ping, daemon=True).start()
