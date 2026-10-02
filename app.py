@@ -51,7 +51,6 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Table for Monitored URLs (Targets)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS targets (
             id TEXT PRIMARY KEY,
@@ -70,7 +69,6 @@ def init_db():
         )
     ''')
     
-    # Table for Ping Logs History
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS ping_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +83,6 @@ def init_db():
         )
     ''')
 
-    # Table for App Config / Self-Ping Settings
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -123,35 +120,22 @@ def set_setting(key: str, value: str):
 # ==============================================================================
 
 def get_automated_self_url() -> str:
-    """
-    Automatically detects the app's public deployment URL without requiring manual input.
-    1. Render standard env var: RENDER_EXTERNAL_URL (e.g., https://myapp.onrender.com)
-    2. Render hostname env var: RENDER_EXTERNAL_HOSTNAME
-    3. Custom SELF_URL env var
-    4. Database saved setting from auto-detection
-    5. Fallback to local loopback http://127.0.0.1:{PORT}
-    """
-    # 1. Direct Render.com environment variable
     render_url = os.environ.get('RENDER_EXTERNAL_URL')
     if render_url and render_url.strip():
         return render_url.strip().rstrip('/')
 
-    # 2. Render external hostname
     render_hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
     if render_hostname and render_hostname.strip():
         return f"https://{render_hostname.strip()}".rstrip('/')
 
-    # 3. Custom env var
     custom_url = os.environ.get('SELF_URL')
     if custom_url and custom_url.strip():
         return custom_url.strip().rstrip('/')
 
-    # 4. Previously auto-detected URL from incoming requests stored in DB
     saved_url = get_setting("self_url", "")
     if saved_url and not saved_url.startswith("http://127.0.0.1") and not saved_url.startswith("http://localhost"):
         return saved_url.rstrip('/')
 
-    # 5. Local internal fallback to guarantee immediate keep-alive
     port = int(os.environ.get('PORT', DEFAULT_PORT))
     return f"http://127.0.0.1:{port}"
 
@@ -161,9 +145,6 @@ def get_automated_self_url() -> str:
 # ==============================================================================
 
 def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI (Self)") -> Dict[str, Any]:
-    """
-    Executes an HTTP GET request to keep the target alive and measures latency.
-    """
     start_time = time.perf_counter()
     headers = {
         'User-Agent': 'PingAI-KeepAlive/2.0 (+https://render.com)',
@@ -205,7 +186,6 @@ def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI 
 
     iso_now = datetime.now(timezone.utc).isoformat()
 
-    # Log to SQLite DB
     try:
         conn = get_db_connection()
         conn.execute('''
@@ -239,7 +219,6 @@ def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI 
                     WHERE id = ?
                 ''', (iso_now, status_code, latency_ms, status_message, target_id))
         
-        # Purge logs older than 400 rows to keep SQLite light
         conn.execute("DELETE FROM ping_logs WHERE id NOT IN (SELECT id FROM ping_logs ORDER BY id DESC LIMIT 400)")
         conn.commit()
         conn.close()
@@ -261,10 +240,6 @@ def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI 
 
 
 def self_keep_alive_job():
-    """
-    Automated self-keep-alive ping job to ensure Render.com free instance never sleeps.
-    Pings every 5 minutes automatically without user configuration.
-    """
     self_enabled = get_setting("self_ping_enabled", "true") == "true"
     if not self_enabled:
         logger.info("Self keep-alive is currently paused by user toggle.")
@@ -279,6 +254,7 @@ def self_keep_alive_job():
 def ping_target_job(target_id: str):
     """
     Worker job executed by APScheduler for a specific registered target.
+    FIXED: Better exception handling so job doesn't silently fail.
     """
     try:
         conn = get_db_connection()
@@ -286,23 +262,26 @@ def ping_target_job(target_id: str):
         conn.close()
         
         if not row:
+            logger.warning(f"Target {target_id} not found in DB. Removing job.")
             if scheduler.get_job(f"target_{target_id}"):
                 scheduler.remove_job(f"target_{target_id}")
             return
             
         if not row['is_active']:
+            logger.info(f"Target {target_id} is paused. Skipping ping.")
             return
 
+        logger.info(f"Executing scheduled ping for target: {row['name']} ({row['url']})")
         execute_ping(row['url'], target_id=row['id'], target_name=row['name'])
     except Exception as e:
-        logger.error(f"Error in ping_target_job for {target_id}: {e}")
+        logger.error(f"Error in ping_target_job for {target_id}: {e}", exc_info=True)
 
 
 def sync_scheduler_jobs():
     """
     Synchronizes APScheduler jobs with current active targets in SQLite.
     """
-    # 1. Sync Automated Self Keep-Alive (Every 5 minutes by default)
+    # 1. Sync Automated Self Keep-Alive
     self_enabled = get_setting("self_ping_enabled", "true") == "true"
     self_interval = int(get_setting("self_ping_interval", str(SELF_PING_INTERVAL_MINUTES)))
     
@@ -333,21 +312,25 @@ def sync_scheduler_jobs():
         for target in targets:
             job_id = f"target_{target['id']}"
             if target['is_active']:
+                # FIXED: Ensure interval is at least 1 minute and job is properly registered
+                interval = max(1, int(target['interval_minutes']))
                 scheduler.add_job(
                     ping_target_job,
                     args=[target['id']],
-                    trigger=IntervalTrigger(minutes=max(1, target['interval_minutes'])),
+                    trigger=IntervalTrigger(minutes=interval),
                     id=job_id,
                     replace_existing=True,
-                    name=f"Keep-Alive for {target['name']}"
+                    name=f"Keep-Alive for {target['name']}",
+                    misfire_grace_time=60  # Allow 60s grace if scheduler was busy
                 )
+                logger.info(f"Scheduled job for '{target['name']}' every {interval} min.")
             else:
                 if scheduler.get_job(job_id):
                     scheduler.remove_job(job_id)
                     
         logger.info(f"Scheduler synchronized with {len(targets)} targets.")
     except Exception as e:
-        logger.error(f"Failed to sync scheduler jobs: {e}")
+        logger.error(f"Failed to sync scheduler jobs: {e}", exc_info=True)
 
 
 # ==============================================================================
@@ -356,9 +339,6 @@ def sync_scheduler_jobs():
 
 @app.before_request
 def auto_detect_self_url():
-    """
-    Captures host header on incoming requests and saves public URL if not already known.
-    """
     current_self = get_setting("self_url", "")
     if not current_self or "127.0.0.1" in current_self or "localhost" in current_self:
         host = request.headers.get('Host', '')
@@ -371,14 +351,12 @@ def auto_detect_self_url():
 
 @app.route('/')
 def index():
-    """Renders the main mobile-first clean light dashboard."""
     return render_template('index.html')
 
 
 @app.route('/healthz')
 @app.route('/ping')
 def healthz():
-    """Lightweight 200 OK endpoint for self-pings and Render health checks."""
     return jsonify({
         "status": "online",
         "app": "Ping AI",
@@ -389,7 +367,6 @@ def healthz():
 
 @app.route('/api/status', methods=['GET'])
 def get_system_status():
-    """Returns dashboard metrics, automated self-ping status, and target summaries."""
     conn = get_db_connection()
     targets = [dict(t) for t in conn.execute("SELECT * FROM targets ORDER BY created_at DESC").fetchall()]
     total_logs = conn.execute("SELECT COUNT(*) as cnt FROM ping_logs").fetchone()['cnt']
@@ -424,7 +401,10 @@ def get_system_status():
 
 @app.route('/api/targets', methods=['POST'])
 def add_target():
-    """Registers a new external Render app URL to monitor and keep alive."""
+    """
+    Registers a new external Render app URL to monitor and keep alive.
+    FIXED: Immediately schedules the job and triggers an initial ping.
+    """
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
     url = (data.get('url') or '').strip()
@@ -458,14 +438,32 @@ def add_target():
     conn.commit()
     conn.close()
 
-    sync_scheduler_jobs()
-    
-    # Run immediate initial ping in background
-    scheduler.add_job(ping_target_job, args=[target_id], id=f"initial_{target_id}", replace_existing=True)
+    # FIXED: Register the recurring job immediately
+    job_id = f"target_{target_id}"
+    scheduler.add_job(
+        ping_target_job,
+        args=[target_id],
+        trigger=IntervalTrigger(minutes=interval),
+        id=job_id,
+        replace_existing=True,
+        name=f"Keep-Alive for {name}",
+        misfire_grace_time=60
+    )
+    logger.info(f"Registered new recurring job '{job_id}' every {interval} min for {name}.")
+
+    # FIXED: Trigger immediate initial ping in background (so user sees activity right away)
+    def run_initial_ping():
+        time.sleep(1)
+        try:
+            execute_ping(url, target_id=target_id, target_name=name)
+        except Exception as e:
+            logger.error(f"Initial ping failed for {name}: {e}")
+
+    threading.Thread(target=run_initial_ping, daemon=True).start()
 
     return jsonify({
         "success": True,
-        "message": f"Target '{name}' added successfully and keep-alive scheduled.",
+        "message": f"Target '{name}' added successfully and keep-alive scheduled every {interval} min.",
         "target": {
             "id": target_id,
             "name": name,
@@ -479,7 +477,6 @@ def add_target():
 
 @app.route('/api/targets/<target_id>', methods=['DELETE'])
 def delete_target(target_id: str):
-    """Deletes a target from the database and stops background keep-alive."""
     conn = get_db_connection()
     conn.execute("DELETE FROM targets WHERE id = ?", (target_id,))
     conn.execute("DELETE FROM ping_logs WHERE target_id = ?", (target_id,))
@@ -495,7 +492,6 @@ def delete_target(target_id: str):
 
 @app.route('/api/targets/<target_id>/toggle', methods=['POST'])
 def toggle_target(target_id: str):
-    """Pauses or resumes keep-alive pinging for a target."""
     conn = get_db_connection()
     row = conn.execute("SELECT is_active, name FROM targets WHERE id = ?", (target_id,)).fetchone()
     if not row:
@@ -507,7 +503,24 @@ def toggle_target(target_id: str):
     conn.commit()
     conn.close()
 
-    sync_scheduler_jobs()
+    job_id = f"target_{target_id}"
+    if new_state:
+        # Resume: re-register the job
+        target_row = get_db_connection().execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
+        if target_row:
+            interval = max(1, int(target_row['interval_minutes']))
+            scheduler.add_job(
+                ping_target_job,
+                args=[target_id],
+                trigger=IntervalTrigger(minutes=interval),
+                id=job_id,
+                replace_existing=True,
+                name=f"Keep-Alive for {target_row['name']}",
+                misfire_grace_time=60
+            )
+    else:
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
 
     action = "resumed" if new_state else "paused"
     return jsonify({
@@ -519,7 +532,6 @@ def toggle_target(target_id: str):
 
 @app.route('/api/targets/<target_id>/ping-now', methods=['POST'])
 def ping_target_now(target_id: str):
-    """Triggers an instantaneous ping on-demand for a target or self."""
     if target_id == "self":
         self_url = get_automated_self_url()
         result = execute_ping(self_url.rstrip('/') + '/healthz', target_id="self", target_name="Ping AI (Self)")
@@ -538,7 +550,6 @@ def ping_target_now(target_id: str):
 
 @app.route('/api/settings', methods=['POST'])
 def update_settings():
-    """Updates self-ping configuration parameters."""
     data = request.get_json() or {}
 
     if 'self_ping_enabled' in data:
@@ -560,7 +571,6 @@ def update_settings():
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
-    """Fetches real-time ping logs."""
     conn = get_db_connection()
     logs = conn.execute("SELECT * FROM ping_logs ORDER BY id DESC LIMIT 100").fetchall()
     conn.close()
@@ -569,7 +579,6 @@ def get_logs():
 
 @app.route('/api/logs', methods=['DELETE'])
 def clear_logs():
-    """Clears all stored ping logs."""
     conn = get_db_connection()
     conn.execute("DELETE FROM ping_logs")
     conn.commit()
@@ -588,7 +597,6 @@ if not scheduler.running:
     sync_scheduler_jobs()
     logger.info("APScheduler worker running in background.")
 
-    # Trigger initial self-ping 3 seconds after startup to verify health immediately
     def delayed_initial_ping():
         time.sleep(3)
         self_keep_alive_job()
