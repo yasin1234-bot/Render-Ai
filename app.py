@@ -36,20 +36,14 @@ DEFAULT_PORT = int(os.environ.get('PORT', 5000))
 SELF_PING_INTERVAL_MINUTES = int(os.environ.get('SELF_PING_INTERVAL_MINUTES', '5'))
 
 # ==============================================================================
-# APScheduler CONFIGURATION (FIXED FOR RENDER FREE TIER)
+# APScheduler CONFIGURATION (BACKUP LAYER)
 # ==============================================================================
-# Use ThreadPoolExecutor with enough workers so pings don't block each other
-# Use MemoryJobStore (not persistent) to avoid stale job conflicts on restart
-jobstores = {
-    'default': MemoryJobStore()
-}
-executors = {
-    'default': ThreadPoolExecutor(max_workers=10)
-}
+jobstores = {'default': MemoryJobStore()}
+executors = {'default': ThreadPoolExecutor(max_workers=10)}
 job_defaults = {
-    'coalesce': True,           # If multiple runs missed, only run once
-    'max_instances': 1,         # Never run same job concurrently
-    'misfire_grace_time': 120,  # 2 min grace if scheduler was busy
+    'coalesce': True,
+    'max_instances': 1,
+    'misfire_grace_time': 300,
 }
 
 scheduler = BackgroundScheduler(
@@ -59,13 +53,23 @@ scheduler = BackgroundScheduler(
     daemon=True
 )
 
+# Global lock to prevent concurrent pings of same target
+_ping_locks: Dict[str, threading.Lock] = {}
+_ping_locks_lock = threading.Lock()
+
+def _get_ping_lock(target_id: str) -> threading.Lock:
+    with _ping_locks_lock:
+        if target_id not in _ping_locks:
+            _ping_locks[target_id] = threading.Lock()
+        return _ping_locks[target_id]
+
 
 # ==============================================================================
 # DATABASE MANAGEMENT (SQLite Persistent Store)
 # ==============================================================================
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -121,8 +125,10 @@ def init_db():
 def get_setting(key: str, default: str = "") -> str:
     try:
         conn = get_db_connection()
-        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        finally:
+            conn.close()
         return row['value'] if row else default
     except Exception:
         return default
@@ -130,12 +136,14 @@ def get_setting(key: str, default: str = "") -> str:
 
 def set_setting(key: str, value: str):
     conn = get_db_connection()
-    conn.execute(
-        "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ==============================================================================
@@ -170,7 +178,7 @@ def get_automated_self_url() -> str:
 def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI (Self)") -> Dict[str, Any]:
     start_time = time.perf_counter()
     headers = {
-        'User-Agent': 'PingAI-KeepAlive/2.0 (+https://render.com)',
+        'User-Agent': 'PingAI-KeepAlive/3.0 (+https://render.com)',
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache'
     }
@@ -209,7 +217,6 @@ def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI 
 
     iso_now = datetime.now(timezone.utc).isoformat()
 
-    # FIXED: Use try/finally to guarantee connection close
     try:
         conn = get_db_connection()
         try:
@@ -265,23 +272,98 @@ def execute_ping(url: str, target_id: str = "self", target_name: str = "Ping AI 
     }
 
 
+# ==============================================================================
+# MANUAL THREAD WORKERS (PRIMARY LAYER — GUARANTEED TO RUN)
+# ==============================================================================
+
+def self_keep_alive_worker():
+    """
+    Manual thread loop for self-ping — same reliable pattern as external targets.
+    Runs forever, checking every 30 seconds whether it's time to ping.
+    """
+    logger.info("[Self Worker] Started.")
+    last_run = 0
+    while True:
+        try:
+            time.sleep(15)  # check every 15s
+            self_enabled = get_setting("self_ping_enabled", "true") == "true"
+            if not self_enabled:
+                continue
+            interval_sec = max(60, int(get_setting("self_ping_interval", str(SELF_PING_INTERVAL_MINUTES))) * 60)
+            now = time.time()
+            if now - last_run >= interval_sec:
+                self_url = get_automated_self_url()
+                ping_url = self_url.rstrip('/') + '/healthz'
+                logger.info(f"[Self Worker] Pinging self: {ping_url}")
+                execute_ping(ping_url, target_id="self", target_name="Ping AI (Self-Ping Worker)")
+                last_run = now
+        except Exception as e:
+            logger.error(f"[Self Worker] Error: {e}", exc_info=True)
+            time.sleep(10)
+
+
+def target_ping_worker():
+    """
+    Manual thread loop for ALL external targets.
+    This is the same logic as self_keep_alive_worker but iterates over every
+    active target in the DB. Runs forever, checking every 20 seconds.
+    """
+    logger.info("[Target Worker] Started.")
+    last_run_map: Dict[str, float] = {}
+    while True:
+        try:
+            time.sleep(20)  # check every 20s
+            conn = get_db_connection()
+            try:
+                targets = conn.execute("SELECT * FROM targets WHERE is_active = 1").fetchall()
+            finally:
+                conn.close()
+
+            now = time.time()
+            for t in targets:
+                tid = t['id']
+                interval_sec = max(60, int(t['interval_minutes']) * 60)
+                last = last_run_map.get(tid, 0)
+                if now - last >= interval_sec:
+                    # Use a per-target lock so we don't double-ping
+                    lock = _get_ping_lock(tid)
+                    if not lock.acquire(blocking=False):
+                        continue
+                    try:
+                        logger.info(f"[Target Worker] Pinging '{t['name']}' ({t['url']})")
+                        execute_ping(t['url'], target_id=tid, target_name=t['name'])
+                        last_run_map[tid] = now
+                    finally:
+                        lock.release()
+        except Exception as e:
+            logger.error(f"[Target Worker] Error: {e}", exc_info=True)
+            time.sleep(10)
+
+
+def start_manual_workers():
+    """Start both manual worker threads (daemon = won't block Flask exit)."""
+    t1 = threading.Thread(target=self_keep_alive_worker, daemon=True, name="SelfKeepAliveWorker")
+    t1.start()
+    t2 = threading.Thread(target=target_ping_worker, daemon=True, name="TargetPingWorker")
+    t2.start()
+    logger.info("Manual background workers started (self + targets).")
+
+
+# ==============================================================================
+# APScheduler JOBS (BACKUP LAYER)
+# ==============================================================================
+
 def self_keep_alive_job():
     self_enabled = get_setting("self_ping_enabled", "true") == "true"
     if not self_enabled:
-        logger.info("Self keep-alive is currently paused by user toggle.")
         return
-
     self_url = get_automated_self_url()
     ping_url = self_url.rstrip('/') + '/healthz'
-    logger.info(f"[Auto Self-Ping] Executing automated keep-alive ping on: {ping_url}")
-    execute_ping(ping_url, target_id="self", target_name="Ping AI (Automated Self-Ping)")
+    logger.info(f"[APScheduler Self] Pinging: {ping_url}")
+    execute_ping(ping_url, target_id="self", target_name="Ping AI (APScheduler Self)")
 
 
 def ping_target_job(target_id: str):
-    """
-    Worker job executed by APScheduler for a specific registered target.
-    FIXED: Guaranteed connection close + clearer logging.
-    """
     try:
         conn = get_db_connection()
         try:
@@ -290,83 +372,76 @@ def ping_target_job(target_id: str):
             conn.close()
         
         if not row:
-            logger.warning(f"Target {target_id} not found in DB. Removing job.")
-            job = scheduler.get_job(f"target_{target_id}")
-            if job:
-                scheduler.remove_job(f"target_{target_id}")
             return
-            
         if not row['is_active']:
-            logger.info(f"Target {target_id} is paused. Skipping ping.")
             return
 
-        logger.info(f"Executing scheduled ping for target: {row['name']} ({row['url']})")
-        execute_ping(row['url'], target_id=row['id'], target_name=row['name'])
+        lock = _get_ping_lock(target_id)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            logger.info(f"[APScheduler] Pinging '{row['name']}' ({row['url']})")
+            execute_ping(row['url'], target_id=row['id'], target_name=row['name'])
+        finally:
+            lock.release()
     except Exception as e:
-        logger.error(f"Error in ping_target_job for {target_id}: {e}", exc_info=True)
+        logger.error(f"[APScheduler] Error for {target_id}: {e}", exc_info=True)
 
 
 def sync_scheduler_jobs():
-    """
-    Synchronizes APScheduler jobs with current active targets in SQLite.
-    FIXED: Removes old jobs before re-adding to prevent overwrite bugs.
-    """
-    # 1. Sync Automated Self Keep-Alive
-    self_enabled = get_setting("self_ping_enabled", "true") == "true"
-    self_interval = int(get_setting("self_ping_interval", str(SELF_PING_INTERVAL_MINUTES)))
-    
-    existing_self = scheduler.get_job("self_keep_alive")
-    if existing_self:
-        scheduler.remove_job("self_keep_alive")
-        
-    if self_enabled:
-        scheduler.add_job(
-            self_keep_alive_job,
-            trigger=IntervalTrigger(minutes=max(1, self_interval)),
-            id="self_keep_alive",
-            replace_existing=True,
-            name="Automated Self Keep-Alive Worker"
-        )
-        logger.info(f"Self Keep-Alive worker active. Interval: every {self_interval} minutes.")
-
-    # 2. Sync Target URLs
+    """Sync APScheduler jobs as a backup to the manual workers."""
     try:
+        self_enabled = get_setting("self_ping_enabled", "true") == "true"
+        self_interval = int(get_setting("self_ping_interval", str(SELF_PING_INTERVAL_MINUTES)))
+        
+        existing_self = scheduler.get_job("self_keep_alive")
+        if existing_self:
+            scheduler.remove_job("self_keep_alive")
+            
+        if self_enabled:
+            scheduler.add_job(
+                self_keep_alive_job,
+                trigger=IntervalTrigger(minutes=max(1, self_interval)),
+                id="self_keep_alive",
+                replace_existing=True,
+                name="Self Keep-Alive (APScheduler Backup)"
+            )
+
         conn = get_db_connection()
         try:
             targets = conn.execute("SELECT * FROM targets").fetchall()
         finally:
             conn.close()
 
-        active_ids = {f"target_{t['id']}" for t in targets}
+        active_ids = {f"target_{t['id']}" for t in targets if t['is_active']}
         for job in scheduler.get_jobs():
             if job.id.startswith("target_") and job.id not in active_ids:
-                scheduler.remove_job(job.id)
+                try:
+                    scheduler.remove_job(job.id)
+                except Exception:
+                    pass
 
         for target in targets:
             job_id = f"target_{target['id']}"
+            existing = scheduler.get_job(job_id)
+            if existing:
+                try:
+                    scheduler.remove_job(job_id)
+                except Exception:
+                    pass
             if target['is_active']:
                 interval = max(1, int(target['interval_minutes']))
-                # Remove old job first to prevent stale triggers
-                existing = scheduler.get_job(job_id)
-                if existing:
-                    scheduler.remove_job(job_id)
                 scheduler.add_job(
                     ping_target_job,
                     args=[target['id']],
                     trigger=IntervalTrigger(minutes=interval),
                     id=job_id,
                     replace_existing=True,
-                    name=f"Keep-Alive for {target['name']}"
+                    name=f"APScheduler Backup: {target['name']}",
+                    next_run_time=datetime.now(timezone.utc)
                 )
-                logger.info(f"Scheduled job for '{target['name']}' every {interval} min.")
-            else:
-                existing = scheduler.get_job(job_id)
-                if existing:
-                    scheduler.remove_job(job_id)
-                    
-        logger.info(f"Scheduler synchronized with {len(targets)} targets.")
     except Exception as e:
-        logger.error(f"Failed to sync scheduler jobs: {e}", exc_info=True)
+        logger.error(f"sync_scheduler_jobs error: {e}", exc_info=True)
 
 
 # ==============================================================================
@@ -382,7 +457,7 @@ def auto_detect_self_url():
         if host and not host.startswith('127.0.0.1') and not host.startswith('localhost'):
             detected = f"{proto}://{host}"
             set_setting("self_url", detected)
-            logger.info(f"Programmatically captured public host: {detected}")
+            logger.info(f"Auto-detected public host: {detected}")
 
 
 @app.route('/')
@@ -474,34 +549,38 @@ def add_target():
     finally:
         conn.close()
 
-    # Register recurring job immediately
+    # APScheduler backup
     job_id = f"target_{target_id}"
     existing = scheduler.get_job(job_id)
     if existing:
-        scheduler.remove_job(job_id)
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
     scheduler.add_job(
         ping_target_job,
         args=[target_id],
         trigger=IntervalTrigger(minutes=interval),
         id=job_id,
         replace_existing=True,
-        name=f"Keep-Alive for {name}"
+        name=f"APScheduler Backup: {name}",
+        next_run_time=datetime.now(timezone.utc)
     )
-    logger.info(f"Registered new recurring job '{job_id}' every {interval} min for {name}.")
 
-    # Immediate initial ping in background
+    # Manual worker: force immediate first ping
     def run_initial_ping():
-        time.sleep(2)
+        time.sleep(1)
         try:
             execute_ping(url, target_id=target_id, target_name=name)
         except Exception as e:
             logger.error(f"Initial ping failed for {name}: {e}")
 
     threading.Thread(target=run_initial_ping, daemon=True).start()
+    logger.info(f"Added target '{name}' (id={target_id}), interval={interval} min.")
 
     return jsonify({
         "success": True,
-        "message": f"Target '{name}' added successfully and keep-alive scheduled every {interval} min.",
+        "message": f"Target '{name}' added successfully. Manual worker will ping every {interval} min.",
         "target": {
             "id": target_id,
             "name": name,
@@ -525,7 +604,10 @@ def delete_target(target_id: str):
 
     job_id = f"target_{target_id}"
     if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
 
     return jsonify({"success": True, "message": "Target removed."})
 
@@ -542,25 +624,34 @@ def toggle_target(target_id: str):
         conn.execute("UPDATE targets SET is_active = ? WHERE id = ?", (new_state, target_id))
         conn.commit()
         target_name = row['name']
-        interval_row = conn.execute("SELECT interval_minutes FROM targets WHERE id = ?", (target_id,)).fetchone()
     finally:
         conn.close()
 
     job_id = f"target_{target_id}"
     existing = scheduler.get_job(job_id)
     if existing:
-        scheduler.remove_job(job_id)
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
 
-    if new_state and interval_row:
-        interval = max(1, int(interval_row['interval_minutes']))
-        scheduler.add_job(
-            ping_target_job,
-            args=[target_id],
-            trigger=IntervalTrigger(minutes=interval),
-            id=job_id,
-            replace_existing=True,
-            name=f"Keep-Alive for {target_name}"
-        )
+    if new_state:
+        conn = get_db_connection()
+        try:
+            trow = conn.execute("SELECT interval_minutes FROM targets WHERE id = ?", (target_id,)).fetchone()
+        finally:
+            conn.close()
+        if trow:
+            interval = max(1, int(trow['interval_minutes']))
+            scheduler.add_job(
+                ping_target_job,
+                args=[target_id],
+                trigger=IntervalTrigger(minutes=interval),
+                id=job_id,
+                replace_existing=True,
+                name=f"APScheduler Backup: {target_name}",
+                next_run_time=datetime.now(timezone.utc)
+            )
 
     action = "resumed" if new_state else "paused"
     return jsonify({
@@ -633,21 +724,30 @@ def clear_logs():
 
 
 # ==============================================================================
-# BOOTSTRAP BACKGROUND SCHEDULER & IMMEDIATE STARTUP SELF-PING
+# BOOTSTRAP
 # ==============================================================================
 
 init_db()
 
+# Start APScheduler (backup layer)
 if not scheduler.running:
     scheduler.start()
     sync_scheduler_jobs()
-    logger.info("APScheduler worker running in background.")
+    logger.info("APScheduler backup layer running.")
 
-    def delayed_initial_ping():
-        time.sleep(5)
-        self_keep_alive_job()
+# Start manual threading workers (PRIMARY layer)
+start_manual_workers()
 
-    threading.Thread(target=delayed_initial_ping, daemon=True).start()
+# One-shot startup self-ping
+def delayed_initial_ping():
+    time.sleep(5)
+    try:
+        self_url = get_automated_self_url()
+        execute_ping(self_url.rstrip('/') + '/healthz', target_id="self", target_name="Ping AI (Startup)")
+    except Exception as e:
+        logger.error(f"Startup self-ping failed: {e}")
+
+threading.Thread(target=delayed_initial_ping, daemon=True).start()
 
 
 if __name__ == '__main__':
